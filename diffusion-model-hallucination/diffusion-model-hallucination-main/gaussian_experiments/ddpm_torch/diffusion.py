@@ -106,7 +106,7 @@ class GaussianDiffusion:
         posterior_logvar = self._extract(self.posterior_logvar_clipped, t, x_0)
         return posterior_mean, posterior_var, posterior_logvar
 
-    def p_mean_var(self, denoise_fn, x_t, t, clip_denoised, return_pred):
+    def p_mean_var(self, denoise_fn, x_t, t, clip_denoised, return_pred, return_score = False):
         B, C, H, W = x_t.shape
         out = denoise_fn(x_t, t)
 
@@ -131,13 +131,18 @@ class GaussianDiffusion:
         elif self.model_mean_type == "eps":
             pred_x_0 = _clip(self._pred_x_0_from_eps(x_t=x_t, eps=out, t=t))
             model_mean, *_ = self.q_posterior_mean_var(x_0=pred_x_0, x_t=x_t, t=t)
+            if return_score:
+                score = self._score_from_eps(eps=out, t=t, x_t=x_t)
         else:
             raise NotImplementedError(self.model_mean_type)
 
+        outputs = [model_mean, model_var, model_logvar]
+
         if return_pred:
-            return model_mean, model_var, model_logvar, pred_x_0
-        else:
-            return model_mean, model_var, model_logvar
+            outputs.append(pred_x_0)
+        if return_score:
+            outputs.append(score)
+        return tuple(outputs)
         
     def _pred_x_0_from_mean(self, x_t, mean, t):
         coef1 = self._extract(self.posterior_mean_coef1, t, x_t)
@@ -149,14 +154,38 @@ class GaussianDiffusion:
         coef2 = self._extract(self.sqrt_recip_m1_alphas_bar, t, x_t)
         return coef1 * x_t - coef2 * eps
 
+    def _score_from_eps(self, x_t, eps, t):
+        sigma = self._extract(self.sqrt_one_minus_alphas_bar, t, x_t)
+        return - eps / sigma
+        
     # === sample ===
 
-    def p_sample_step(self, denoise_fn, x_t, t, clip_denoised=True, return_pred=False, generator=None):
-        model_mean, _, model_logvar, pred_x_0 = self.p_mean_var(
-            denoise_fn, x_t, t, clip_denoised=clip_denoised, return_pred=True)
+    def p_sample_step(self, denoise_fn, x_t, t, clip_denoised=True, return_pred=False, return_score=False, generator=None):
+
+        outputs = self.p_mean_var(
+            denoise_fn, x_t, t, clip_denoised=clip_denoised, return_pred=True, return_score=return_score)
+        model_mean, _, model_logvar, pred_x_0, *rest = outputs
+        score = rest[0] if return_score else None
+
         noise = torch.empty_like(x_t).normal_(generator=generator)
         nonzero_mask = (t > 0).reshape((-1,) + (1,) * (x_t.ndim - 1)).to(x_t)
         sample = model_mean + nonzero_mask * torch.exp(0.5 * model_logvar) * noise
+        if return_score:
+            return sample, pred_x_0, score
+        return (sample, pred_x_0) if return_pred else sample
+    
+    def p_sample_step_mod(self, denoise_fn1, denoise_fn2, x_t, t, omega, clip_denoised=True, return_pred=False, return_score=False, generator=None):
+
+        outputs = self.p_mean_var_mod(
+            denoise_fn1, denoise_fn2, x_t, t, omega=omega, clip_denoised=clip_denoised, return_pred=True, return_score=return_score)
+        model_mean, _, model_logvar, pred_x_0, *rest = outputs
+        score = rest[0] if return_score else None
+
+        noise = torch.empty_like(x_t).normal_(generator=generator)
+        nonzero_mask = (t > 0).reshape((-1,) + (1,) * (x_t.ndim - 1)).to(x_t)
+        sample = model_mean + nonzero_mask * torch.exp(0.5 * model_logvar) * noise
+        if return_score:
+            return sample, pred_x_0, score
         return (sample, pred_x_0) if return_pred else sample
 
     @torch.inference_mode()
@@ -176,6 +205,22 @@ class GaussianDiffusion:
         return x_t
     
     @torch.inference_mode()
+    def p_sample_mod(self, denoise_fn1, denoise_fn2, omega, shape=None, device=torch.device("cpu"), noise=None, seed=None):
+        B = (shape or noise.shape)[0]
+        t = torch.empty((B, ), dtype=torch.int64, device=device)
+        rng = None
+        if seed is not None:
+            rng = torch.Generator(device).manual_seed(seed)
+        if noise is None:
+            x_t = torch.empty(shape, device=device).normal_(generator=rng)
+        else:
+            x_t = noise.to(device)
+        for ti in range(self.timesteps - 1, -1, -1):
+            t.fill_(ti)
+            x_t = self.p_sample_step_mod(denoise_fn1, denoise_fn2, x_t, t, omega=omega, generator=rng)
+        return x_t
+    
+    @torch.inference_mode()
     def p_sample_save_all(self, denoise_fn, shape=None, device=torch.device("cpu"), noise=None, seed=None):
         B = (shape or noise.shape)[0]
         t = torch.empty((B, ), dtype=torch.int64, device=device)
@@ -189,12 +234,37 @@ class GaussianDiffusion:
         noise_copy = copy.deepcopy(x_t)
         pred_x0_all = []
         xt_all = []
+        score_all = []
         for ti in range(self.timesteps - 1, -1, -1):
             t.fill_(ti)
-            x_t, pred_x0 = self.p_sample_step(denoise_fn, x_t, t, generator=rng, return_pred=True)
+            x_t, pred_x0, score = self.p_sample_step(denoise_fn, x_t, t, generator=rng, return_pred=True, return_score=True)
             pred_x0_all.append(pred_x0.clone().detach().cpu())
             xt_all.append(x_t.clone().detach().cpu())
-        return x_t, noise_copy, xt_all, pred_x0_all
+            score_all.append(score.clone().detach().cpu())
+        return x_t, noise_copy, xt_all, pred_x0_all, score_all
+    
+    @torch.inference_mode()
+    def p_sample_save_all_mod(self, denoise_fn1, denoise_fn2, omega, shape=None, device=torch.device("cpu"), noise=None, seed=None):
+        B = (shape or noise.shape)[0]
+        t = torch.empty((B, ), dtype=torch.int64, device=device)
+        rng = None
+        if seed is not None:
+            rng = torch.Generator(device).manual_seed(seed)
+        if noise is None:
+            x_t = torch.empty(shape, device=device).normal_(generator=rng)
+        else:
+            x_t = noise.to(device)
+        noise_copy = copy.deepcopy(x_t)
+        pred_x0_all = []
+        xt_all = []
+        score_all = []
+        for ti in range(self.timesteps - 1, -1, -1):
+            t.fill_(ti)
+            x_t, pred_x0, score = self.p_sample_step_mod(denoise_fn1, denoise_fn2, x_t, t, omega=omega, generator=rng, return_pred=True, return_score=True)
+            pred_x0_all.append(pred_x0.clone().detach().cpu())
+            xt_all.append(x_t.clone().detach().cpu())
+            score_all.append(score.clone().detach().cpu())
+        return x_t, noise_copy, xt_all, pred_x0_all, score_all
     
     @torch.inference_mode()
     def p_sample_progressive(
@@ -289,3 +359,4 @@ class GaussianDiffusion:
         prior_bpd = self._prior_bpd(x_0)
         total_bpd = torch.sum(losses, dim=1) + prior_bpd
         return total_bpd, losses, prior_bpd, mses
+
